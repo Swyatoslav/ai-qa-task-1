@@ -4,7 +4,7 @@
 
 ## Архитектура решения
 
-*   **`generate_tests.py`**: Основной скрипт. Формирует структурированный промпт, отправляет его в Ollama API по адресу `http://localhost:11434` и обрабатывает ответ.
+*   **`task_2/generate_tests.py`**: Основной скрипт. Формирует структурированный промпт, отправляет его в Ollama API по адресу `http://localhost:11434` и обрабатывает ответ.
 *   **Ollama**: Локальный сервер LLM, работающий как фоновый процесс (`daemon`) в macOS.
 *   **LLM Model**: Используется `llama3.1:8b-instruct-fp16`. Модель выбрана за баланс между скоростью работы на CPU/GPU и качеством следования инструкциям на русском языке.
 
@@ -37,7 +37,7 @@ ollama pull llama3.1:8b-instruct-fp16
 Создайте папку для проекта и перейдите в неё:
 
 ```
-mkdir test_generator && cd test_generator
+mkdir task_2/test_generator && cd task_2/test_generator
 ```
 
 (Поместите файл со скриптом generate_tests.py в эту директорию)
@@ -60,17 +60,17 @@ pip install ollama
 Для генерации стандартного количества сценариев (5 штук):
 
 ```
-python generate_tests.py
+python task_2/generate_tests.py
 ```
 
 Для указания произвольного количества сценариев используйте аргумент --count (или сокращенно -c):
 
 ```
-python generate_tests.py --count 7
+python task_2/generate_tests.py --count 7
 ```
 или
 ```
-python generate_tests.py -c 3
+python task_2/generate_tests.py -c 3
 ```
 
 Ограничения аргументов: минимальное значение — 1, максимальное — 20.
@@ -80,5 +80,5 @@ python generate_tests.py -c 3
 Чтобы сразу записать вывод в Markdown-файл, перенаправьте поток вывода:
 
 ```
-python generate_tests.py --count 5 > registration_scenarios.md
+python task_2/generate_tests.py --count 5 > task_2/registration_scenarios.md
 ```

@@ -1,0 +1,14 @@
+Ты - QA Automation Lead. Напиши по 1 автотесту на каждый из следующих кейсов:
+
+1. DELETE: https://jsonplaceholder.typicode.com/posts/1
+Ожидаемый ответ: 200 статус
+2. PATCH: https://jsonplaceholder.typicode.com/posts/1
+Тело запроса: {title: 'foo'}
+Заголовки запроса: {'Content-type': 'application/json; charset=UTF-8'}
+Ожидаемый ответ: 200 статус
+3. PATCH: https://jsonplaceholder.typicode.com/posts/some-string
+Тело запроса: {title: 'foo'}
+Заголовки запроса: {'Content-type': 'application/json; charset=UTF-8'}
+Ожидаемый ответ: 200 статус
+
+Автотесты должны использовать стек python + pytest + requests

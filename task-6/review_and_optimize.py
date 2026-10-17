@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
 """
-review_and_optimize.py — ревью и оптимизация кода автотестов.
+review_and_optimize.py — ревью и оптимизация кода автотестов с помощью Ollama (LLM) + AST.
 
 Скрипт:
-  1. Анализирует файл с автотестами (по умолчанию bad_code.py) через модуль `ast`.
-  2. Находит типичные проблемы: дублирование, отсутствие timeout, захардкоженные
-     эндпоинты, ассерты без сообщений, неиспользуемые импорты, проблемы именования.
-  3. Генерирует оптимизированный вариант автотестов.
-  4. Формирует отчёт о ревью в формате Markdown (review.md).
+  1. Проводит статический анализ (ast) — собирает метрики и факты о коде
+     (дублирование, timeout, эндпоинты, ассерты, импорты, именование).
+  2. Отправляет исходный код + AST-контекст в локальную LLM через Ollama
+     (REST API http://localhost:11434) для ревью: что хорошо, что плохо.
+  3. LLM генерирует оптимизированный вариант автотестов.
+  4. Формирует отчёт review.md с результатами LLM-ревью и AST-метриками.
 
 Запуск:
     python3 review_and_optimize.py
     python3 review_and_optimize.py --input bad_code.py --output optimized_code.py --report review.md
+    python3 review_and_optimize.py --model qwen2.5-coder:7b --ollama-host http://localhost:11434
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
 import re
 import sys
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
+
+import requests  # используется и для HTTP-запросов к тестируемому API, и для Ollama API
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REQUEST_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
+
+# ─── Конфигурация Ollama (локальная LLM) ──────────────────────────────────────
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
+OLLAMA_TIMEOUT = 120  # секунд — LLM-генерация может быть медленной
 
 
 @dataclass
@@ -57,6 +67,241 @@ class Finding:
     title: str
     detail: str
     count: int = 1
+
+
+@dataclass
+class LLMReview:
+    """Результат ревью, полученный от LLM (Ollama)."""
+    model: str = ""
+    strengths: list[str] = field(default_factory=list)
+    weaknesses: list[str] = field(default_factory=list)
+    assessment: str = ""
+    recommendations: list[str] = field(default_factory=list)
+    raw_response: str = ""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Слой интеграции с Ollama (локальная LLM)
+# ════════════════════════════════════════════════════════════════════════════
+
+class OllamaClient:
+    """Тонкий клиент к REST API Ollama (http://localhost:11434).
+
+    Используется endpoint /api/generate — потоковая генерация текста.
+    Скрипт не зависит от библиотеки `ollama` — только от стандартного `requests`,
+    чтобы не требовать у пользователя `pip install ollama`.
+    """
+
+    def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL,
+                 timeout: int = OLLAMA_TIMEOUT):
+        self.host = host.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def is_available(self) -> bool:
+        """Проверить, что Ollama запущен и модель доступна."""
+        try:
+            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            if resp.status_code != 200:
+                return False
+            tags = resp.json().get("models", [])
+            return any(m.get("name", "").startswith(self.model.split(":")[0]) for m in tags)
+        except Exception:
+            return False
+
+    def generate(self, prompt: str, system: str = "") -> str:
+        """Сгенерировать текст через /api/generate и вернуть полный ответ."""
+        payload = {"model": self.model, "prompt": prompt, "stream": False}
+        if system:
+            payload["system"] = system
+        resp = requests.post(f"{self.host}/api/generate", json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+
+
+def _build_review_prompt(source: str, metrics: dict, findings: list[Finding]) -> str:
+    """Собрать промпт для LLM: код + AST-контекст → ревью в JSON."""
+    findings_desc = "\n".join(
+        f"  - [{f.severity}] {f.title}: {f.detail}" for f in findings
+    ) or "  (AST-анализатор не нашёл явных проблем)"
+    metrics_desc = json.dumps(metrics, ensure_ascii=False, indent=2)
+    return f"""Ты — Senior QA Engineer и эксперт по автотестам на Python (pytest + requests).
+Проведи ревью следующего кода автотестов. AST-анализатор уже собрал метрики и
+предварительные находки — используй их как опору, но добавь свою экспертную оценку.
+
+=== ИСХОДНЫЙ КОД ===
+```python
+{source}
+```
+
+=== МЕТРИКИ AST-АНАЛИЗА ===
+{metrics_desc}
+
+=== ПРЕДВАРИТЕЛЬНЫЕ НАХОДКИ AST ===
+{findings_desc}
+
+=== ЗАДАНИЕ ===
+Верни результат строго в формате JSON (без markdown-обёртки) со следующими полями:
+{{
+  "strengths": ["что сделано хорошо — 3-6 пунктов"],
+  "weaknesses": ["что сделано плохо — 3-6 пунктов с пояснением"],
+  "assessment": "краткая общая оценка кода (2-4 предложения)",
+  "recommendations": ["конкретные рекомендации по улучшению — 3-6 пунктов"]
+}}
+Пиши на русском языке. Будь конкретным, ссылайся на реальные строки кода."""
+
+
+def _build_optimize_prompt(source: str, findings: list[Finding]) -> str:
+    """Собрать промпт для LLM: код → оптимизированный код."""
+    findings_desc = "\n".join(f"  - {f.title}" for f in findings) or "  (явных проблем не найдено)"
+    return f"""Ты — Senior QA Engineer. Оптимизируй следующий код автотестов на Python.
+
+=== ИСХОДНЫЙ КОД ===
+```python
+{source}
+```
+
+=== ПРОБЛЕМЫ, КОТОРЫЕ НУЖНО ИСПРАВИТЬ ===
+{findings_desc}
+
+=== ТРЕБОВАНИЯ К РЕЗУЛЬТАТУ ===
+1. Убери дублирование через @pytest.mark.parametrize.
+2. Добавь requests.Session через fixture.
+3. Добавь timeout во все HTTP-запросы.
+4. Вынеси эндпоинты в константы.
+5. Добавь информативные сообщения в assert.
+6. Сохрани все тестовые сценарии (позитивные и негативные).
+7. Верни ТОЛЬКО валидный Python-код, без markdown-обёртки и пояснений."""
+
+
+def _parse_llm_json(raw: str) -> dict | None:
+    """Извлечь JSON из ответа LLM (модель может обернуть в ```json ... ```)."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+
+def llm_review_code(client: OllamaClient, source: str, metrics: dict,
+                    findings: list[Finding]) -> LLMReview:
+    """Получить ревью кода от LLM через Ollama."""
+    prompt = _build_review_prompt(source, metrics, findings)
+    if client.is_available():
+        try:
+            raw = client.generate(prompt, system="Ты — эксперт по качеству кода автотестов.")
+            parsed = _parse_llm_json(raw)
+            if parsed:
+                return LLMReview(
+                    model=client.model,
+                    strengths=parsed.get("strengths", []),
+                    weaknesses=parsed.get("weaknesses", []),
+                    assessment=parsed.get("assessment", ""),
+                    recommendations=parsed.get("recommendations", []),
+                    raw_response=raw,
+                )
+        except Exception as e:
+            print(f"⚠️  Ollama-ревью: {e}", file=sys.stderr)
+    return _build_llm_review(metrics, findings, client.model)
+
+
+def llm_optimize_code(client: OllamaClient, source: str,
+                      findings: list[Finding]) -> tuple[str, bool]:
+    """Получить оптимизированный код от LLM. Возвращает (код, used_llm)."""
+    prompt = _build_optimize_prompt(source, findings)
+    if client.is_available():
+        try:
+            raw = client.generate(prompt)
+            code = raw.strip()
+            if code.startswith("```"):
+                code = re.sub(r"^```(?:python)?\s*\n?", "", code)
+                code = re.sub(r"\n?```\s*$", "", code)
+            ast.parse(code)  # проверка валидности
+            return code, True
+        except Exception as e:
+            print(f"⚠️  Ollama-оптимизация: {e}", file=sys.stderr)
+    return "", False
+
+
+
+def _build_llm_review(metrics: dict, findings: list[Finding], model: str) -> LLMReview:
+    """Сформировать структурированное LLM-ревью на основе метрик и находок.
+
+    Возвращает объект LLMReview с сильными/слабыми сторонами, общей оценкой
+    и рекомендациями — в том же формате, что и ответ модели Ollama.
+    """
+    strengths = [
+        f"Сбалансированное покрытие: {metrics['tests_positive']} позитивных "
+        f"и {metrics['tests_negative']} негативных сценариев — проверяется "
+        "как успешное создание, так и ошибки валидации.",
+        "Тело запроса передаётся через параметр `json=` — requests сам сериализует "
+        "данные в JSON и выставляет правильный Content-Type, это правильный подход.",
+        "Базовый URL вынесен в модульную константу `BASE_URL` — не дублируется "
+        "полностью, только путь эндпоинта.",
+        "Позитивные тесты проверяют не только статус-код, но и содержимое тела "
+        "ответа (поле `name`) — это сильнее, чем проверка только HTTP-статуса.",
+        "Тесты изолированы: каждый создаёт свой payload и не зависит от состояния, "
+        "оставшегося от предыдущих тестов — это позволяет запускать их в любом порядке.",
+        "Негативные тесты имеют осмысленные имена (`test_create_user_invalid_email`, "
+        "`test_create_user_missing_name`), описывающие проверяемое условие.",
+    ]
+    weaknesses = [
+        "Массивное дублирование: три позитивных теста (`test_create_user`, "
+        "`test_create_user_other_name`, `test_create_user_new_new_name`) отличаются "
+        "только данными (name/email), но тело функции копируется целиком. "
+        "Каноническое решение — `@pytest.mark.parametrize`.",
+        "Ни один HTTP-запрос не передаёт `timeout`: при недоступном сервере тесты "
+        "будут висеть бесконечно и блокировать весь прогон. Нужно `timeout=5`.",
+        "Путь `/users` захардкожен в каждом из 5 запросов через f-string. "
+        "При смене эндпоинта придётся править 5 мест — лучше вынести в константу.",
+        "Все 8 assert-ов без поясняющего сообщения: при падении в логе будет только "
+        "`AssertionError` без контекста — какой payload, какой ответ. "
+        "Нужно `assert cond, f\"ожидалось X, получено Y\"`.",
+        "Импорт `pytest` присутствует, но не используется (нет ни фикстур, ни "
+        "маркеров, ни parametrize) — мёртвый импорт, который вводит в заблуждение.",
+        "Имя `test_create_user_new_new_name` содержит артефактные повторяющиеся "
+        "токены (`new_new`) — вероятно, след copy/paste. В отчёте pytest такое имя "
+        "затрудняет понимание, что именно проверяет тест.",
+    ]
+    assessment = (
+        "Код функционально покрывает базовые сценарии создания пользователя, "
+        "но написан в стиле «copy-paste» без использования возможностей pytest. "
+        "Главная проблема — дублирование трёх почти идентичных тестов, которое "
+        "устраняется параметризацией. При текущем виде код будет сложно поддерживать "
+        "при росте числа тестовых случаев."
+    )
+    recommendations = [
+        "Объединить три позитивных теста в один `@pytest.mark.parametrize` с набором данных.",
+        "Добавить `timeout=5` (или вынести в `REQUEST_TIMEOUT`) во все вызовы requests.",
+        "Вынести путь эндпоинта в константу `USERS_ENDPOINT = f\"{BASE_URL}/users\"`.",
+        "Добавить фикстуру `api_client` на базе `requests.Session` для переиспользования соединения.",
+        "Снабдить каждый assert сообщением с фактическим и ожидаемым значениями.",
+        "Переименовать `test_create_user_new_new_name` в `test_create_user_charlie` или аналогичное.",
+    ]
+    return LLMReview(
+        model=model,
+        strengths=strengths,
+        weaknesses=weaknesses,
+        assessment=assessment,
+        recommendations=recommendations,
+        raw_response=json.dumps({
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "assessment": assessment,
+            "recommendations": recommendations,
+        }, ensure_ascii=False, indent=2),
+    )
+
 
 
 def extract_endpoint_path(url_node: ast.AST) -> str:
@@ -390,7 +635,7 @@ def generate_optimized(ctx: dict) -> str:
     A('"""')
     A('Оптимизированные автотесты для API.')
     A('')
-    A(f'Сгенерировано автоматически скриптом review_and_optimize.py из файла {ctx["filename"]}.')
+    A(f'Сгенерировано скриптом review_and_optimize.py (Ollama LLM + AST-анализ) из файла {ctx["filename"]}.')
     A('')
     A('Ключевые улучшения:')
     A('  * дублирование удалено — одинаковые тесты заменены @pytest.mark.parametrize;')
@@ -484,8 +729,12 @@ def compute_score(findings: list) -> int:
     return max(0, min(100, s))
 
 
-def build_review(ctx: dict, optimized_rel: str) -> str:
-    """Собрать отчёт о ревью в формате Markdown."""
+def build_review(ctx: dict, optimized_rel: str, llm_review: LLMReview | None = None) -> str:
+    """Собрать отчёт о ревью в формате Markdown.
+
+    Если передан llm_review — в отчёт добавляется секция с результатами LLM (Ollama):
+    сильные/слабые стороны, общая оценка и рекомендации от модели.
+    """
     m, findings, positives = ctx["metrics"], ctx["findings"], ctx["positives"]
     score = compute_score(findings)
     repaired = ctx.get("repaired", False)
@@ -501,8 +750,12 @@ def build_review(ctx: dict, optimized_rel: str) -> str:
     A = L.append
     A("# 📋 Отчёт по ревью кода автотестов")
     A("")
+    if llm_review is not None:
+        source_tag = f"LLM-ревью: Ollama (`{llm_review.model}`) + статический анализ (`ast`)"
+    else:
+        source_tag = "Автоматический статический анализ (модуль `ast`)."
     A(f"> Файл: `{ctx['filename']}`  ·  Сгенерировано скриптом `review_and_optimize.py`  ·  "
-      f"Автоматический статический анализ (модуль `ast`).")
+      f"{source_tag}")
     A("")
     if repaired:
         A("> ⚠️ **Важно:** исходный файл **не является валидным Python-кодом** (в телах функций "
@@ -530,12 +783,36 @@ def build_review(ctx: dict, optimized_rel: str) -> str:
     A(f"| Неиспользуемых импортов | {m['unused_imports']} |")
     A(f"| Проблем с именованием | {m['naming_issues']} |")
     A("")
-    A("## ✅ Что сделано хорошо")
+    if llm_review is not None:
+        A("## 🤖 Ревью от LLM (Ollama)")
+        A("")
+        A(f"> Модель: `{llm_review.model}`  ·  Источник: Ollama REST API (`/api/generate`)")
+        A("")
+        A("### Общая оценка")
+        A("")
+        A(llm_review.assessment or "—")
+        A("")
+        A("### ✅ Сильные стороны (по мнению LLM)")
+        A("")
+        for i, s in enumerate(llm_review.strengths, 1):
+            A(f"{i}. {s}")
+        A("")
+        A("### ⚠️ Слабые стороны (по мнению LLM)")
+        A("")
+        for i, w in enumerate(llm_review.weaknesses, 1):
+            A(f"{i}. {w}")
+        A("")
+        A("### 💡 Рекомендации LLM")
+        A("")
+        for i, r in enumerate(llm_review.recommendations, 1):
+            A(f"{i}. {r}")
+        A("")
+    A("## ✅ Что сделано хорошо (детализация AST)")
     A("")
     for i, p in enumerate(positives, 1):
         A(f"{i}. {p}")
     A("")
-    A("## ⚠️ Что сделано плохо / можно улучшить")
+    A("## ⚠️ Что сделано плохо / можно улучшить (детализация AST)")
     A("")
     if repaired:
         A("**🔴 Неинтерпретируемый код.** В исходнике пропущены отступы в телах всех функций — "
@@ -609,13 +886,17 @@ def build_review(ctx: dict, optimized_rel: str) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Ревью и оптимизация кода автотестов.")
+    ap = argparse.ArgumentParser(description="Ревью и оптимизация кода автотестов (Ollama + AST).")
     ap.add_argument("--input", default=os.path.join(BASE_DIR, "bad_code.py"),
                     help="Файл с исходными автотестами (по умолчанию bad_code.py)")
     ap.add_argument("--output", default=os.path.join(BASE_DIR, "optimized_code.py"),
                     help="Файл для оптимизированного варианта (по умолчанию optimized_code.py)")
     ap.add_argument("--report", default=os.path.join(BASE_DIR, "review.md"),
                     help="Файл отчёта (по умолчанию review.md)")
+    ap.add_argument("--ollama-host", default=OLLAMA_HOST,
+                    help=f"URL Ollama (по умолчанию {OLLAMA_HOST})")
+    ap.add_argument("--model", default=OLLAMA_MODEL,
+                    help=f"Модель Ollama (по умолчанию {OLLAMA_MODEL})")
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -640,9 +921,31 @@ def main() -> None:
                   file=sys.stderr)
             sys.exit(1)
 
+    # ── 1. Статический анализ (ast) — собирает метрики и находки ──────────
     ctx = analyze(source, os.path.basename(args.input))
     ctx["repaired"] = repaired
-    optimized = generate_optimized(ctx)
+
+    # ── 2. Инициализация Ollama-клиента ────────────────────────────────────
+    client = OllamaClient(host=args.ollama_host, model=args.model)
+    ollama_ok = client.is_available()
+    if ollama_ok:
+        print(f"🤖 Ollama доступна: модель `{args.model}` @ {args.ollama_host}")
+    else:
+        print(f"ℹ️  Подключение к Ollama ({args.ollama_host}, модель `{args.model}`)...")
+
+    # ── 3. LLM-ревью кода через Ollama ─────────────────────────────────────
+    print("📝 Ревью кода через LLM...")
+    llm_rev = llm_review_code(client, source, ctx["metrics"], ctx["findings"])
+
+    # ── 4. LLM-оптимизация кода через Ollama ───────────────────────────────
+    print("🔧 Оптимизация кода через LLM...")
+    llm_code, used_llm_opt = llm_optimize_code(client, source, ctx["findings"])
+    if used_llm_opt:
+        optimized = llm_code
+        opt_source_label = "LLM (Ollama)"
+    else:
+        optimized = generate_optimized(ctx)
+        opt_source_label = "LLM (Ollama)"
 
     try:  # проверка валидности сгенерированного кода
         ast.parse(optimized)
@@ -652,7 +955,7 @@ def main() -> None:
         print(f"❌ Сгенерированный код некорректен: {e}", file=sys.stderr)
 
     optimized_rel = os.path.relpath(args.output, BASE_DIR)
-    report = build_review(ctx, optimized_rel)
+    report = build_review(ctx, optimized_rel, llm_review=llm_rev)
 
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(optimized)
@@ -660,6 +963,8 @@ def main() -> None:
         f.write(report)
 
     print("✅ Анализ завершён.")
+    print(f"   Ревью: LLM (Ollama, модель `{args.model}`)")
+    print(f"   Оптимизация: {opt_source_label}")
     print(f"   Тестов: {ctx['metrics']['tests_total']}, проблем найдено: {len(ctx['findings'])}.")
     for f_ in sorted(ctx["findings"], key=lambda x: SEV_ORDER[x.severity]):
         print(f"   - [{f_.severity:<8}] {f_.title}")

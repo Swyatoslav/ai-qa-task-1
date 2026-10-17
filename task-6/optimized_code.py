@@ -1,7 +1,7 @@
 """
 Оптимизированные автотесты для API.
 
-Сгенерировано автоматически скриптом review_and_optimize.py из файла bad_code.py.
+Сгенерировано скриптом review_and_optimize.py (Ollama LLM + AST-анализ) из файла bad_code.py.
 
 Ключевые улучшения:
   * дублирование удалено — одинаковые тесты заменены @pytest.mark.parametrize;

@@ -1,0 +1,83 @@
+services:
+  # ─────────────────────────────────────────────────────────────
+  # Ollama — локальный LLM-движок (OpenAI-compatible API на :11434)
+  # ─────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: task8-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # Для GPU раскомментируйте deploy.resources (NVIDIA Container Toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Однократная загрузка модели qwen2.5:7b в Ollama
+  ollama-init:
+    image: ollama/ollama:0.5.4
+    container_name: task8-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["sh", "-c"]
+    command: ["ollama pull qwen2.5:7b && echo 'model ready'"]
+    restart: "no"
+
+  # ─────────────────────────────────────────────────────────────
+  # Агент — УЯЗВИМАЯ версия (порт 8001)
+  # ─────────────────────────────────────────────────────────────
+  agent-vulnerable:
+    build: ./agent
+    container_name: task8-agent-vulnerable
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    environment:
+      - AGENT_MODE=vulnerable
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      - MODEL=qwen2.5:7b
+      - DB_PATH=/app/data/agent.db
+    ports:
+      - "8001:8000"
+    volumes:
+      - agent-data:/app/data
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────
+  # Агент — ЗАЩИЩЁННАЯ версия (порт 8002)
+  # ─────────────────────────────────────────────────────────────
+  agent-protected:
+    build: ./agent
+    container_name: task8-agent-protected
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    environment:
+      - AGENT_MODE=protected
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      - MODEL=qwen2.5:7b
+      - DB_PATH=/app/data/agent.db
+    ports:
+      - "8002:8000"
+    volumes:
+      - agent-data-protected:/app/data
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
+  agent-data:
+  agent-data-protected:
